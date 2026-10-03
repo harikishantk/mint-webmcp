@@ -31,12 +31,19 @@ export type CompiledField =
       required: boolean;
       values: string[];
       description?: string;
+      widget?: "select" | "radio";
     }
   | {
       kind: "checkboxes";
       name: string;
       required: boolean;
       values: string[];
+      description?: string;
+    }
+  | {
+      kind: "boolean";
+      name: string;
+      required: boolean;
       description?: string;
     };
 

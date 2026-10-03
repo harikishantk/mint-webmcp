@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { z } from "zod";
 import { LightpandaSession } from "./browser-session.js";
 import type { CompiledFormTool } from "./types.js";
+import { assertLightpandaAvailable } from "./preflight.js";
 
 const LIGHTPANDA_BIN = process.env.LIGHTPANDA_BIN ?? "lightpanda";
 const LIGHTPANDA_PORT = Number(process.env.LIGHTPANDA_PORT ?? "9222");
@@ -19,6 +22,9 @@ type RegisteredTool = ReturnType<McpServer["registerTool"]>;
 const dynamicFormTools: RegisteredTool[] = [];
 
 function zodForField(field: CompiledFormTool["fields"][number]): z.ZodTypeAny {
+  if (field.kind === "boolean") {
+    return z.boolean().optional();
+  }
   if (field.kind === "enum") {
     if (field.values.length >= 1) {
       return z.enum(field.values as [string, ...string[]]).optional();
@@ -45,7 +51,13 @@ function registerFormTools(tools: CompiledFormTool[]): void {
       autoSubmit: z
         .boolean()
         .optional()
-        .describe("Submit after filling (WebMCP toolautosubmit). Default true."),
+        .describe(
+          "Submit after filling (WebMCP toolautosubmit). Default false — pass true or confirmSubmit: true to submit.",
+        ),
+      confirmSubmit: z
+        .boolean()
+        .optional()
+        .describe("Alias for autoSubmit: true — explicit confirmation to submit after fill."),
     };
     for (const field of ft.fields) {
       shape[field.name] = zodForField(field);
@@ -85,20 +97,23 @@ server.tool(
       name: t.toolName,
       description: t.description,
     }));
+    const payload: Record<string, unknown> = {
+      url: result.url,
+      title: result.title,
+      formTools: toolList,
+    };
+    if (toolList.length === 0) {
+      payload.hint =
+        "No classic HTML <form> elements were detected. SPAs, div-based UIs, and login walls may need generic browser MCP instead.";
+    } else {
+      payload.hint =
+        "New MCP tools were registered for each form. Call them by name with field values (autoSubmit defaults to false; pass autoSubmit: true or confirmSubmit: true to submit). Then web_export_script to save a PandaScript replay.";
+    }
     return {
       content: [
         {
           type: "text" as const,
-          text: JSON.stringify(
-            {
-              url: result.url,
-              title: result.title,
-              formTools: toolList,
-              hint: "New MCP tools were registered for each form. Call them by name with field values.",
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
     };
@@ -133,7 +148,56 @@ server.tool(
   },
 );
 
+server.tool(
+  "web_export_script",
+  "Generate a replayable PandaScript (.js) for a compiled form tool. Uses field values from the last form_* call unless values are passed. Optionally write to disk.",
+  {
+    toolName: z.string().describe("Compiled form tool name, e.g. form_0_post"),
+    path: z
+      .string()
+      .optional()
+      .describe("If set, write the script to this file path (absolute or relative to cwd)"),
+    autoSubmit: z
+      .boolean()
+      .optional()
+      .describe("Include submit + wait (default: same as last invoke, else false)"),
+  },
+  async ({ toolName, path, autoSubmit }) => {
+    const script = session.exportPandaScript(toolName, { autoSubmit });
+    let written: string | undefined;
+    if (path) {
+      const out = resolve(path);
+      await writeFile(out, script, "utf8");
+      written = out;
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              toolName,
+              written,
+              run: written ? `lightpanda run ${written}` : "lightpanda run script.js",
+              script,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
 async function main(): Promise<void> {
+  try {
+    assertLightpandaAvailable(LIGHTPANDA_BIN);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+    console.error("Run: npm run doctor");
+    process.exit(1);
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.on("SIGINT", async () => {

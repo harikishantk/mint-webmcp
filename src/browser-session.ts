@@ -1,7 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from "playwright-core";
-import type { CompiledFormTool, DetectedForm } from "./types.js";
+import type { CompiledField, CompiledFormTool, DetectedForm } from "./types.js";
 import { compileForms } from "./form-compiler.js";
+import { generatePandaScript } from "./pandascript.js";
+import { shouldSubmitForm, stripSubmitFlags } from "./submit.js";
 
 export type AttachResult = {
   url: string;
@@ -18,6 +20,8 @@ export class LightpandaSession {
   private port: number;
   private compiled: CompiledFormTool[] = [];
   private currentUrl = "";
+  private attachUrl = "";
+  private lastFillByTool = new Map<string, { values: Record<string, unknown>; autoSubmit: boolean }>();
 
   constructor(
     private readonly lightpandaBin: string,
@@ -34,17 +38,45 @@ export class LightpandaSession {
     return this.currentUrl;
   }
 
+  getLastFill(toolName: string): { values: Record<string, unknown>; autoSubmit: boolean } | undefined {
+    return this.lastFillByTool.get(toolName);
+  }
+
   async attach(url: string, timeoutMs = 30_000): Promise<AttachResult> {
     await this.ensureBrowser();
     const page = this.page!;
     await page.goto(url, { waitUntil: "load", timeout: timeoutMs });
     this.currentUrl = page.url();
+    this.attachUrl = this.currentUrl;
     const title = await page.title();
 
     const forms = await this.detectForms();
     this.compiled = compileForms(forms, this.currentUrl);
+    this.lastFillByTool.clear();
 
     return { url: this.currentUrl, title, tools: this.compiled };
+  }
+
+  exportPandaScript(
+    toolName: string,
+    overrides?: { values?: Record<string, unknown>; autoSubmit?: boolean },
+  ): string {
+    const tool = this.compiled.find((t) => t.toolName === toolName);
+    if (!tool) {
+      throw new Error(`Unknown form tool "${toolName}". Call web_attach first.`);
+    }
+    if (!this.currentUrl) {
+      throw new Error("No page attached.");
+    }
+    const last = this.lastFillByTool.get(toolName);
+    const values = overrides?.values ?? last?.values ?? {};
+    const autoSubmit = overrides?.autoSubmit ?? last?.autoSubmit ?? false;
+    return generatePandaScript({
+      pageUrl: this.attachUrl || this.currentUrl,
+      tool,
+      values,
+      autoSubmit,
+    });
   }
 
   async invokeForm(toolName: string, args: Record<string, unknown>): Promise<string> {
@@ -55,14 +87,36 @@ export class LightpandaSession {
 
     const page = this.page!;
     const formRoot = page.locator("form").nth(tool.formIndex);
-    const autoSubmit = args.autoSubmit !== false;
+    const autoSubmit = shouldSubmitForm(args);
+    const fieldArgs = stripSubmitFlags(args);
+    this.lastFillByTool.set(toolName, {
+      values: fieldArgs,
+      autoSubmit,
+    });
 
     for (const field of tool.fields) {
-      const value = args[field.name];
+      const value = fieldArgs[field.name];
       if (value === undefined || value === null) continue;
 
       if (field.kind === "enum") {
-        await formRoot.locator(`input[type="radio"][name="${cssEscape(field.name)}"][value="${cssEscape(String(value))}"]`).check();
+        const radio = formRoot.locator(
+          `input[type="radio"][name="${cssEscape(field.name)}"][value="${cssEscape(String(value))}"]`,
+        );
+        if ((await radio.count()) > 0) {
+          await radio.check();
+        } else {
+          await formRoot.locator(`select[name="${cssEscape(field.name)}"]`).selectOption(String(value));
+        }
+        continue;
+      }
+
+      if (field.kind === "boolean") {
+        const box = formRoot.locator(`input[type="checkbox"][name="${cssEscape(field.name)}"]`).first();
+        if (value === true || value === "true" || value === 1 || value === "1") {
+          await box.check();
+        } else {
+          await box.uncheck().catch(() => undefined);
+        }
         continue;
       }
 
@@ -83,11 +137,18 @@ export class LightpandaSession {
       await formRoot.locator(selector).first().fill(String(value));
     }
 
+    let validationErrors = await collectValidationErrors(formRoot, tool.fields);
+
     if (!autoSubmit) {
+      const status = validationErrors.length ? "validation_error" : "filled";
       return JSON.stringify(
         {
-          status: "filled",
-          message: "Form filled; autoSubmit was false. Submit manually or call again with autoSubmit: true.",
+          status,
+          validationErrors,
+          message:
+            status === "filled"
+              ? "Form filled; pass autoSubmit: true or confirmSubmit: true to submit."
+              : "Form filled but validation errors were detected on the page.",
           url: page.url(),
           title: await page.title(),
         },
@@ -100,11 +161,51 @@ export class LightpandaSession {
       'button[type="submit"], input[type="submit"], button:not([type="button"])',
     ).first();
 
+    const beforeSubmitUrl = page.url();
     await submit.click();
     await page.waitForLoadState("load", { timeout: 15_000 }).catch(() => undefined);
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
 
     this.currentUrl = page.url();
+
+    if (page.url() !== beforeSubmitUrl) {
+      let markdown = "";
+      try {
+        const md = await this.cdp!.send("LP.getMarkdown" as never, {} as never);
+        markdown = (md as { markdown?: string }).markdown ?? "";
+      } catch {
+        markdown = (await page.locator("body").innerText()).slice(0, 8000);
+      }
+
+      return JSON.stringify(
+        {
+          status: "submitted",
+          validationErrors: [],
+          url: this.currentUrl,
+          title: await page.title(),
+          markdown: markdown.slice(0, 12_000),
+          replay: `web_export_script { "toolName": ${JSON.stringify(toolName)} }`,
+        },
+        null,
+        2,
+      );
+    }
+
+    const postSubmitErrors = await collectValidationErrors(formRoot, tool.fields);
+    if (postSubmitErrors.length > 0) {
+      return JSON.stringify(
+        {
+          status: "validation_error",
+          validationErrors: postSubmitErrors,
+          url: page.url(),
+          title: await page.title(),
+          message: "Submit was attempted but validation errors remain on the page.",
+        },
+        null,
+        2,
+      );
+    }
+
     let markdown = "";
     try {
       const md = await this.cdp!.send("LP.getMarkdown" as never, {} as never);
@@ -116,9 +217,11 @@ export class LightpandaSession {
     return JSON.stringify(
       {
         status: "submitted",
+        validationErrors: [],
         url: this.currentUrl,
         title: await page.title(),
         markdown: markdown.slice(0, 12_000),
+        replay: `web_export_script { "toolName": ${JSON.stringify(toolName)} }`,
       },
       null,
       2,
@@ -164,6 +267,64 @@ export class LightpandaSession {
 
 function cssEscape(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+export type ValidationError = { field: string; message?: string };
+
+async function collectValidationErrors(
+  formRoot: ReturnType<Page["locator"]>,
+  fields: CompiledField[],
+): Promise<ValidationError[]> {
+  const raw = await formRoot.evaluate((form) => {
+    const errors: { field: string; message?: string }[] = [];
+    const seen = new Set<string>();
+
+    const add = (field: string, message?: string) => {
+      if (!field || seen.has(field)) return;
+      seen.add(field);
+      errors.push({ field, message });
+    };
+
+    for (const el of form.querySelectorAll('[aria-invalid="true"]')) {
+      const name =
+        (el as HTMLInputElement).name ||
+        el.getAttribute("id") ||
+        el.getAttribute("aria-describedby") ||
+        "unknown";
+      const described = el.getAttribute("aria-describedby");
+      let message: string | undefined;
+      if (described) {
+        const node = form.querySelector(`#${CSS.escape(described.split(/\s+/)[0] ?? "")}`);
+        message = node?.textContent?.trim() || undefined;
+      }
+      add(name, message);
+    }
+
+    for (const el of form.querySelectorAll(".error, .invalid, [role='alert'], .field-error, .form-error")) {
+      const text = el.textContent?.trim();
+      const labelled =
+        el.getAttribute("data-for") ||
+        el.getAttribute("for") ||
+        el.closest("label")?.querySelector("input, select, textarea")?.getAttribute("name");
+      if (labelled) add(labelled, text || undefined);
+      else if (text) add("_form", text);
+    }
+
+    for (const input of form.querySelectorAll("input, select, textarea")) {
+      const inp = input as HTMLInputElement;
+      if (!inp.name) continue;
+      if (inp.required && !String(inp.value ?? "").trim()) {
+        add(inp.name, inp.validationMessage || "Required field is empty");
+      } else if (!inp.checkValidity?.() && inp.validationMessage) {
+        add(inp.name, inp.validationMessage);
+      }
+    }
+
+    return errors;
+  });
+
+  const knownNames = new Set(fields.map((f) => f.name));
+  return raw.filter((e) => e.field === "_form" || knownNames.has(e.field) || e.field !== "unknown");
 }
 
 async function waitForCdp(endpoint: string, timeoutMs: number): Promise<void> {

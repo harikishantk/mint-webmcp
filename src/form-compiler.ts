@@ -21,10 +21,28 @@ function guessFormPurpose(fields: CompiledField[], action: string): string {
   return `Submit form (${action || "same page"})`;
 }
 
+function fieldDescription(group: DetectedForm["fields"]): string | undefined {
+  const withPlaceholder = group.find((f) => f.placeholder?.trim());
+  if (withPlaceholder?.placeholder) return withPlaceholder.placeholder.trim();
+  const labelish = group[0]?.name?.replace(/[-_]+/g, " ").trim();
+  return labelish || undefined;
+}
+
+function isSelectField(f: DetectedForm["fields"][number]): boolean {
+  return f.tagName?.toLowerCase() === "select" || (f.options != null && f.options.length > 0);
+}
+
 function compileFields(raw: DetectedForm["fields"]): CompiledField[] {
   const byName = new Map<string, DetectedForm["fields"]>();
   for (const f of raw) {
     if (f.disabled || !f.name) continue;
+    const tag = f.tagName?.toLowerCase() ?? "input";
+    if (tag === "select") {
+      const list = byName.get(f.name) ?? [];
+      list.push(f);
+      byName.set(f.name, list);
+      continue;
+    }
     const t = (f.inputType ?? "text").toLowerCase();
     if (SKIP_INPUT_TYPES.has(t)) continue;
     const list = byName.get(f.name) ?? [];
@@ -35,7 +53,35 @@ function compileFields(raw: DetectedForm["fields"]): CompiledField[] {
   const out: CompiledField[] = [];
   for (const [name, group] of byName) {
     const required = group.some((f) => f.required);
-    const desc = group.find((f) => f.placeholder)?.placeholder;
+    const desc = fieldDescription(group);
+
+    if (group.length === 1 && isSelectField(group[0])) {
+      const sel = group[0];
+      const values = (sel.options ?? []).map((o) => o.value).filter((v) => v !== "");
+      out.push({
+        kind: "enum",
+        name,
+        required,
+        values,
+        description: desc,
+        widget: "select",
+      });
+      continue;
+    }
+
+    if (
+      group.length === 1 &&
+      (group[0].inputType ?? "").toLowerCase() === "checkbox" &&
+      !isSelectField(group[0])
+    ) {
+      out.push({
+        kind: "boolean",
+        name,
+        required,
+        description: desc,
+      });
+      continue;
+    }
 
     if (group.length > 1 && group.every((f) => (f.inputType ?? "").toLowerCase() === "radio")) {
       out.push({
@@ -44,6 +90,7 @@ function compileFields(raw: DetectedForm["fields"]): CompiledField[] {
         required,
         values: group.map((f) => f.value ?? "").filter(Boolean),
         description: desc,
+        widget: "radio",
       });
       continue;
     }
@@ -90,6 +137,9 @@ function fieldToJsonSchema(f: CompiledField): Record<string, unknown> {
       uniqueItems: true,
     };
   }
+  if (f.kind === "boolean") {
+    return { ...base, type: "boolean" };
+  }
   return { ...base, type: "string" };
 }
 
@@ -113,8 +163,13 @@ export function compileForms(forms: DetectedForm[], pageUrl: string): CompiledFo
         ...properties,
         autoSubmit: {
           type: "boolean",
-          description: "Submit after filling (WebMCP toolautosubmit). Default true.",
-          default: true,
+          description:
+            "Submit after filling (WebMCP toolautosubmit). Default false — pass true or confirmSubmit: true to submit.",
+          default: false,
+        },
+        confirmSubmit: {
+          type: "boolean",
+          description: "Alias for autoSubmit: true — explicit confirmation to submit after fill.",
         },
       },
       additionalProperties: false,

@@ -9,7 +9,15 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsx src/server.ts"
+    "dev": "tsx src/server.ts",
+    "doctor": "node scripts/doctor.mjs",
+    "smoke": "npm run build && node scripts/smoke.mjs",
+    "test:script-gen": "npm run build && node scripts/test-pandascript-gen.mjs",
+    "test:replay": "npm run build && node scripts/replay-smoke.mjs",
+    "prestart": "npm run build --if-present"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "keywords": ["mcp", "lightpanda", "webmcp", "forms"],
   "license": "MIT",
