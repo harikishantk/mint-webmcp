@@ -1,0 +1,26 @@
+{
+  "name": "mint-webmcp",
+  "version": "0.1.0",
+  "description": "Mint WebMCP-style MCP tools from HTML forms via Lightpanda",
+  "type": "module",
+  "bin": {
+    "mint-webmcp": "./dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts"
+  },
+  "keywords": ["mcp", "lightpanda", "webmcp", "forms"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "playwright-core": "^1.58.2",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
